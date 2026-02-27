@@ -145,6 +145,172 @@ impl Dproj {
 
         Ok(())
     }
+
+    // ─── Listing helpers ─────────────────────────────────────────────────
+
+    /// Return the names of all build configurations defined in the project
+    /// (e.g. `["Debug", "Release"]`), in document order.
+    pub fn configurations(&self) -> Vec<&str> {
+        self.project
+            .item_groups
+            .iter()
+            .flat_map(|ig| &ig.build_configurations)
+            .map(|bc| bc.name.as_str())
+            .collect()
+    }
+
+    /// Return all platforms listed in `<BorlandProject><Platforms>`,
+    /// together with their active flag (e.g. `[("Win32", true), ("Win64", false)]`).
+    ///
+    /// Falls back to the `<TargetedPlatforms>` bitmask or the unconditional
+    /// `<Platform>` element when the `<Platforms>` section is absent.
+    pub fn platforms(&self) -> Vec<(&str, bool)> {
+        // Primary source: ProjectExtensions > BorlandProject > Platforms
+        if let Some(ext) = &self.project.project_extensions {
+            if let Some(bp) = &ext.borland_project {
+                if !bp.platforms.is_empty() {
+                    return bp
+                        .platforms
+                        .iter()
+                        .map(|p| (p.value.as_str(), p.active))
+                        .collect();
+                }
+            }
+        }
+
+        // Fallback: unconditional <Platform> element.
+        for pg in &self.project.property_groups {
+            if pg.condition.is_none() {
+                if let Some(p) = &pg.project_properties.platform {
+                    return vec![(p.as_str(), true)];
+                }
+            }
+        }
+
+        Vec::new()
+    }
+
+    /// The project's active configuration name (e.g. `"Debug"`).
+    pub fn active_configuration(&self) -> Result<String, DprojError> {
+        self.active_config_platform().map(|(c, _)| c)
+    }
+
+    /// The project's active platform name (e.g. `"Win32"`).
+    pub fn active_platform(&self) -> Result<String, DprojError> {
+        self.active_config_platform().map(|(_, p)| p)
+    }
+
+    // ─── Setters for default config / platform ───────────────────────────
+
+    /// Change the project's default configuration (the text inside the
+    /// `<Config>` or `<Configuration>` element in the first unconditional
+    /// `<PropertyGroup>`).  Both the raw XML source and the in-memory
+    /// struct are updated.
+    pub fn set_configuration(&mut self, value: &str) -> Result<(), DprojError> {
+        self.set_default_element(&["Config", "Configuration"], value, |pp, v| {
+            // Update whichever field was present.
+            if pp.config.is_some() {
+                pp.config = Some(v.to_string());
+            }
+            if pp.configuration.is_some() {
+                pp.configuration = Some(v.to_string());
+            }
+        })
+    }
+
+    /// Change the project's default platform (the text inside the
+    /// `<Platform>` element in the first unconditional `<PropertyGroup>`).
+    /// Both the raw XML source and the in-memory struct are updated.
+    pub fn set_platform(&mut self, value: &str) -> Result<(), DprojError> {
+        self.set_default_element(&["Platform"], value, |pp, v| {
+            pp.platform = Some(v.to_string());
+        })
+    }
+
+    /// Shared implementation for [`set_configuration`](Self::set_configuration)
+    /// and [`set_platform`](Self::set_platform).
+    ///
+    /// Searches unconditional `<PropertyGroup>`s for the first element
+    /// whose tag matches one of `candidates`, then byte-splices the new
+    /// value into the raw source and calls `update_fn` on the in-memory
+    /// [`ProjectProperties`].
+    fn set_default_element<F>(
+        &mut self,
+        candidates: &[&str],
+        value: &str,
+        update_fn: F,
+    ) -> Result<(), DprojError>
+    where
+        F: Fn(&mut ProjectProperties, &str),
+    {
+        let doc = roxmltree::Document::parse(&self.source)?;
+
+        // Walk PropertyGroup nodes in document order, looking for the first
+        // unconditional one that contains a matching child element.
+        let mut pg_index = 0usize;
+        let mut found = None;
+
+        for pg_node in doc
+            .root_element()
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "PropertyGroup")
+        {
+            if pg_node.attribute("Condition").is_some() {
+                pg_index += 1;
+                continue;
+            }
+
+            for &tag in candidates {
+                if let Some(element) = pg_node
+                    .children()
+                    .find(|n| n.is_element() && n.tag_name().name() == tag)
+                {
+                    found = Some((pg_index, element.range(), element.children().find(|n| n.is_text()).map(|t| t.range()), tag));
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+            pg_index += 1;
+        }
+
+        let (pg_idx, elem_range, text_range, tag) = found.ok_or_else(|| {
+            DprojError::new(format!(
+                "No <{}> element found in any unconditional PropertyGroup",
+                candidates.join("> or <")
+            ))
+        })?;
+
+        // Byte-splice the raw source.
+        if let Some(range) = text_range {
+            self.source.replace_range(range, value);
+        } else {
+            // Self-closing / empty element — rewrite entire element, preserving attributes.
+            let doc2 = roxmltree::Document::parse(&self.source)?;
+            let element = doc2
+                .root_element()
+                .children()
+                .filter(|n| n.is_element() && n.tag_name().name() == "PropertyGroup")
+                .nth(pg_idx)
+                .and_then(|pg| pg.children().find(|n| n.is_element() && n.tag_name().name() == tag))
+                .unwrap();
+            let attrs: String = element
+                .attributes()
+                .map(|a| format!(" {}=\"{}\"", a.name(), a.value()))
+                .collect();
+            self.source
+                .replace_range(elem_range, &format!("<{tag}{attrs}>{value}</{tag}>"));
+        }
+
+        // Update in-memory struct.
+        update_fn(
+            &mut self.project.property_groups[pg_idx].project_properties,
+            value,
+        );
+
+        Ok(())
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -780,7 +946,7 @@ impl Dproj {
     /// contribute when their condition is satisfied by the resolved variable
     /// map.  Later values override earlier ones.
     pub fn active_property_group(&self) -> Result<PropertyGroup, DprojError> {
-        let (config, platform) = self.default_config_platform()?;
+        let (config, platform) = self.active_config_platform()?;
         self.active_property_group_for(&config, &platform)
     }
 
@@ -812,9 +978,9 @@ impl Dproj {
         Ok(result)
     }
 
-    /// Extract the default `(Config, Platform)` from the project's
+    /// Extract the active `(Config, Platform)` from the project's
     /// unconditional property groups.
-    fn default_config_platform(&self) -> Result<(String, String), DprojError> {
+    fn active_config_platform(&self) -> Result<(String, String), DprojError> {
         let mut config: Option<String> = None;
         let mut platform: Option<String> = None;
 
@@ -1493,6 +1659,71 @@ mod tests {
         let result = dproj.active_property_group_for("DoesNotExist", "Win32");
         assert!(result.is_err());
     }
+
+    // ── Listing helpers ──────────────────────────────────────────────────
+
+    #[test]
+    fn configurations_lists_all() {
+        let dproj = Dproj::from_file("example.dproj").unwrap();
+        let configs = dproj.configurations();
+        assert!(configs.contains(&"Debug"));
+        assert!(configs.contains(&"Release"));
+        assert!(configs.len() >= 2);
+    }
+
+    #[test]
+    fn platforms_lists_all() {
+        let dproj = Dproj::from_file("example.dproj").unwrap();
+        let platforms = dproj.platforms();
+        // example.dproj should have at least Win32
+        let names: Vec<&str> = platforms.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"Win32"), "expected Win32 in {names:?}");
+    }
+
+    #[test]
+    fn active_configuration_and_platform() {
+        let dproj = Dproj::from_file("example.dproj").unwrap();
+        assert_eq!(dproj.active_configuration().unwrap(), "Debug");
+        assert_eq!(dproj.active_platform().unwrap(), "Win32");
+    }
+
+    #[test]
+    fn set_configuration_round_trip() {
+        let source = std::fs::read_to_string("example.dproj").unwrap();
+        let mut dproj = Dproj::parse(source).unwrap();
+
+        assert_eq!(dproj.active_configuration().unwrap(), "Debug");
+
+        dproj.set_configuration("Release").unwrap();
+
+        // In-memory struct updated
+        assert_eq!(dproj.active_configuration().unwrap(), "Release");
+
+        // Raw source updated
+        assert!(dproj.source().contains(">Release</Config>"));
+
+        // active_property_group now resolves Release
+        let pg = dproj.active_property_group().unwrap();
+        assert_eq!(pg.project_properties.project_version.as_deref(), Some("20.1"));
+    }
+
+    #[test]
+    fn set_platform_round_trip() {
+        let source = std::fs::read_to_string("example.dproj").unwrap();
+        let mut dproj = Dproj::parse(source).unwrap();
+
+        assert_eq!(dproj.active_platform().unwrap(), "Win32");
+
+        dproj.set_platform("Win64").unwrap();
+
+        // In-memory struct updated
+        assert_eq!(dproj.active_platform().unwrap(), "Win64");
+
+        // Raw source updated
+        assert!(dproj.source().contains(">Win64</Platform>"));
+    }
+
+    // ── Merging ──────────────────────────────────────────────────────────
 
     #[test]
     fn merge_overrides_values() {
