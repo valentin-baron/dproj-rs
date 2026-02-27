@@ -32,33 +32,33 @@ use std::collections::HashMap;
 
 /// A parsed MSBuild condition expression.
 #[derive(Debug, Clone, PartialEq)]
-pub enum CondExpr {
+pub enum Expression {
     /// `'lhs' == 'rhs'` or `'lhs' != 'rhs'`.
     Compare {
-        lhs: Vec<StringPart>,
+        lhs: Vec<ExprValue>,
         op: CompareOp,
-        rhs: Vec<StringPart>,
+        rhs: Vec<ExprValue>,
     },
     /// `Exists('path')` — always evaluates to `true` (no filesystem checks).
-    Exists(Vec<StringPart>),
+    Exists(Vec<ExprValue>),
     /// `a and b` (case-insensitive keyword).
-    And(Box<CondExpr>, Box<CondExpr>),
+    And(Box<Expression>, Box<Expression>),
     /// `a or b` (case-insensitive keyword).
-    Or(Box<CondExpr>, Box<CondExpr>),
+    Or(Box<Expression>, Box<Expression>),
 }
 
 /// Comparison operator used inside a [`CondExpr::Compare`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareOp {
     /// `==`
-    Eq,
+    Equal,
     /// `!=`
-    Ne,
+    NotEqual,
 }
 
 /// A fragment of a string value that may contain `$(Variable)` references.
 #[derive(Debug, Clone, PartialEq)]
-pub enum StringPart {
+pub enum ExprValue {
     /// Literal text (no variable expansion needed).
     Literal(String),
     /// A `$(VarName)` reference that will be expanded during evaluation.
@@ -73,7 +73,7 @@ pub enum StringPart {
 ///
 /// `$(VarName)` sequences become [`StringPart::Variable`]; everything else
 /// becomes [`StringPart::Literal`].
-fn parse_string_parts(s: &str) -> Vec<StringPart> {
+fn parse_string_parts(s: &str) -> Vec<ExprValue> {
     let mut parts = Vec::new();
     let mut literal = String::new();
     let mut chars = s.chars().peekable();
@@ -81,18 +81,18 @@ fn parse_string_parts(s: &str) -> Vec<StringPart> {
     while let Some(c) = chars.next() {
         if c == '$' && chars.peek() == Some(&'(') {
             if !literal.is_empty() {
-                parts.push(StringPart::Literal(std::mem::take(&mut literal)));
+                parts.push(ExprValue::Literal(std::mem::take(&mut literal)));
             }
             chars.next(); // consume '('
             let var_name: String = chars.by_ref().take_while(|&ch| ch != ')').collect();
-            parts.push(StringPart::Variable(var_name));
+            parts.push(ExprValue::Variable(var_name));
         } else {
             literal.push(c);
         }
     }
 
     if !literal.is_empty() {
-        parts.push(StringPart::Literal(literal));
+        parts.push(ExprValue::Literal(literal));
     }
 
     parts
@@ -103,7 +103,7 @@ fn parse_string_parts(s: &str) -> Vec<StringPart> {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Build the chumsky parser for MSBuild condition expressions.
-fn condition_parser<'a>() -> impl Parser<'a, &'a str, CondExpr, extra::Err<Simple<'a, char>>> {
+fn condition_parser<'a>() -> impl Parser<'a, &'a str, Expression, extra::Err<Simple<'a, char>>> {
     recursive(|expr| {
         // ── Single-quoted string value ───────────────────────────────────
         let quoted = just('\'')
@@ -113,15 +113,15 @@ fn condition_parser<'a>() -> impl Parser<'a, &'a str, CondExpr, extra::Err<Simpl
 
         // ── Comparison operators ─────────────────────────────────────────
         let cmp_op = just("==")
-            .to(CompareOp::Eq)
-            .or(just("!=").to(CompareOp::Ne));
+            .to(CompareOp::Equal)
+            .or(just("!=").to(CompareOp::NotEqual));
 
         // ── Comparison:  'lhs' op 'rhs' ─────────────────────────────────
         let comparison = quoted
             .padded()
             .then(cmp_op.padded())
             .then(quoted.padded())
-            .map(|((lhs, op), rhs)| CondExpr::Compare { lhs, op, rhs });
+            .map(|((lhs, op), rhs)| Expression::Compare { lhs, op, rhs });
 
         // ── Case-insensitive alphabetic word (for keyword matching) ──────
         let alpha_word = any()
@@ -136,7 +136,7 @@ fn condition_parser<'a>() -> impl Parser<'a, &'a str, CondExpr, extra::Err<Simpl
             .ignore_then(just('(').padded())
             .ignore_then(quoted)
             .then_ignore(just(')').padded())
-            .map(CondExpr::Exists);
+            .map(Expression::Exists);
 
         // ── Parenthesized expression ─────────────────────────────────────
         let paren_expr = expr.delimited_by(just('(').padded(), just(')').padded());
@@ -151,7 +151,7 @@ fn condition_parser<'a>() -> impl Parser<'a, &'a str, CondExpr, extra::Err<Simpl
 
         let and_expr = atom.clone().foldl(
             and_kw.ignore_then(atom).repeated(),
-            |lhs, rhs| CondExpr::And(Box::new(lhs), Box::new(rhs)),
+            |lhs, rhs| Expression::And(Box::new(lhs), Box::new(rhs)),
         );
 
         // ── 'or' — lowest precedence ────────────────────────────────────
@@ -161,13 +161,13 @@ fn condition_parser<'a>() -> impl Parser<'a, &'a str, CondExpr, extra::Err<Simpl
 
         and_expr.clone().foldl(
             or_kw.ignore_then(and_expr).repeated(),
-            |lhs, rhs| CondExpr::Or(Box::new(lhs), Box::new(rhs)),
+            |lhs, rhs| Expression::Or(Box::new(lhs), Box::new(rhs)),
         )
     })
 }
 
 /// Parse a condition attribute string into a [`CondExpr`] AST.
-pub fn parse_condition(input: &str) -> Result<CondExpr, String> {
+pub fn parse_condition(input: &str) -> Result<Expression, String> {
     condition_parser()
         .parse(input)
         .into_result()
@@ -187,12 +187,12 @@ pub fn parse_condition(input: &str) -> Result<CondExpr, String> {
 
 /// Expand `$(Var)` references in a parsed string expression.
 /// Unknown variables expand to the empty string.
-fn expand_string(parts: &[StringPart], vars: &HashMap<String, String>) -> String {
+fn expand_string(parts: &[ExprValue], vars: &HashMap<String, String>) -> String {
     parts
         .iter()
         .map(|part| match part {
-            StringPart::Literal(s) => s.clone(),
-            StringPart::Variable(name) => vars.get(name.as_str()).cloned().unwrap_or_default(),
+            ExprValue::Literal(s) => s.clone(),
+            ExprValue::Variable(name) => vars.get(name.as_str()).cloned().unwrap_or_default(),
         })
         .collect()
 }
@@ -201,19 +201,19 @@ fn expand_string(parts: &[StringPart], vars: &HashMap<String, String>) -> String
 ///
 /// `Exists(…)` always evaluates to `true` — filesystem checks are not
 /// performed.
-pub fn evaluate(expr: &CondExpr, vars: &HashMap<String, String>) -> bool {
+pub fn evaluate(expr: &Expression, vars: &HashMap<String, String>) -> bool {
     match expr {
-        CondExpr::Compare { lhs, op, rhs } => {
+        Expression::Compare { lhs, op, rhs } => {
             let l = expand_string(lhs, vars);
             let r = expand_string(rhs, vars);
             match op {
-                CompareOp::Eq => l == r,
-                CompareOp::Ne => l != r,
+                CompareOp::Equal => l == r,
+                CompareOp::NotEqual => l != r,
             }
         }
-        CondExpr::Exists(_) => true,
-        CondExpr::And(a, b) => evaluate(a, vars) && evaluate(b, vars),
-        CondExpr::Or(a, b) => evaluate(a, vars) || evaluate(b, vars),
+        Expression::Exists(_) => true,
+        Expression::And(a, b) => evaluate(a, vars) && evaluate(b, vars),
+        Expression::Or(a, b) => evaluate(a, vars) || evaluate(b, vars),
     }
 }
 
@@ -321,7 +321,7 @@ mod tests {
         let expr =
             parse_condition("'$(Config)'=='Base' or '$(Base)'!=''").unwrap();
         match &expr {
-            CondExpr::Or(lhs, rhs) => {
+            Expression::Or(lhs, rhs) => {
                 assert!(matches!(lhs.as_ref(), CondExpr::Compare { op: CompareOp::Eq, .. }));
                 assert!(matches!(rhs.as_ref(), CondExpr::Compare { op: CompareOp::Ne, .. }));
             }
@@ -343,7 +343,7 @@ mod tests {
         let input = "('$(Platform)'=='Win32' and '$(Base)'=='true') or '$(Base_Win32)'!=''";
         let expr = parse_condition(input).unwrap();
         match &expr {
-            CondExpr::Or(lhs, _rhs) => {
+            Expression::Or(lhs, _rhs) => {
                 assert!(matches!(lhs.as_ref(), CondExpr::And(_, _)));
             }
             other => panic!("expected Or(And(..), ..), got {other:?}"),
@@ -356,7 +356,7 @@ mod tests {
             parse_condition("Exists('$(BDS)\\Bin\\CodeGear.Delphi.Targets')")
                 .unwrap();
         match &expr {
-            CondExpr::Exists(parts) => {
+            Expression::Exists(parts) => {
                 assert_eq!(parts[0], StringPart::Variable("BDS".into()));
                 assert_eq!(
                     parts[1],
