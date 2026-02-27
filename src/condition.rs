@@ -231,7 +231,7 @@ mod tests {
     fn string_parts_literal_only() {
         assert_eq!(
             parse_string_parts("hello"),
-            vec![StringPart::Literal("hello".into())]
+            vec![ExprValue::Literal("hello".into())]
         );
     }
 
@@ -239,7 +239,7 @@ mod tests {
     fn string_parts_variable_only() {
         assert_eq!(
             parse_string_parts("$(Config)"),
-            vec![StringPart::Variable("Config".into())]
+            vec![ExprValue::Variable("Config".into())]
         );
     }
 
@@ -248,16 +248,16 @@ mod tests {
         assert_eq!(
             parse_string_parts("$(APPDATA)\\Embarcadero\\$(BDSAPPDATABASEDIR)"),
             vec![
-                StringPart::Variable("APPDATA".into()),
-                StringPart::Literal("\\Embarcadero\\".into()),
-                StringPart::Variable("BDSAPPDATABASEDIR".into()),
+                ExprValue::Variable("APPDATA".into()),
+                ExprValue::Literal("\\Embarcadero\\".into()),
+                ExprValue::Variable("BDSAPPDATABASEDIR".into()),
             ]
         );
     }
 
     #[test]
     fn string_parts_empty() {
-        assert_eq!(parse_string_parts(""), Vec::<StringPart>::new());
+        assert_eq!(parse_string_parts(""), Vec::<ExprValue>::new());
     }
 
     // ── Condition parsing ────────────────────────────────────────────────
@@ -267,10 +267,10 @@ mod tests {
         let expr = parse_condition("'$(Config)'=='Base'").unwrap();
         assert_eq!(
             expr,
-            CondExpr::Compare {
-                lhs: vec![StringPart::Variable("Config".into())],
-                op: CompareOp::Eq,
-                rhs: vec![StringPart::Literal("Base".into())],
+            Expression::Compare {
+                lhs: vec![ExprValue::Variable("Config".into())],
+                op: CompareOp::Equal,
+                rhs: vec![ExprValue::Literal("Base".into())],
             }
         );
     }
@@ -280,9 +280,9 @@ mod tests {
         let expr = parse_condition("'$(Config)'==''").unwrap();
         assert_eq!(
             expr,
-            CondExpr::Compare {
-                lhs: vec![StringPart::Variable("Config".into())],
-                op: CompareOp::Eq,
+            Expression::Compare {
+                lhs: vec![ExprValue::Variable("Config".into())],
+                op: CompareOp::Equal,
                 rhs: vec![],
             }
         );
@@ -293,9 +293,9 @@ mod tests {
         let expr = parse_condition("'$(Base)'!=''").unwrap();
         assert_eq!(
             expr,
-            CondExpr::Compare {
-                lhs: vec![StringPart::Variable("Base".into())],
-                op: CompareOp::Ne,
+            Expression::Compare {
+                lhs: vec![ExprValue::Variable("Base".into())],
+                op: CompareOp::NotEqual,
                 rhs: vec![],
             }
         );
@@ -308,9 +308,9 @@ mod tests {
         let expr = parse_condition(" '$(Configuration)' == '' ").unwrap();
         assert_eq!(
             expr,
-            CondExpr::Compare {
-                lhs: vec![StringPart::Variable("Configuration".into())],
-                op: CompareOp::Eq,
+            Expression::Compare {
+                lhs: vec![ExprValue::Variable("Configuration".into())],
+                op: CompareOp::Equal,
                 rhs: vec![],
             }
         );
@@ -322,8 +322,8 @@ mod tests {
             parse_condition("'$(Config)'=='Base' or '$(Base)'!=''").unwrap();
         match &expr {
             Expression::Or(lhs, rhs) => {
-                assert!(matches!(lhs.as_ref(), CondExpr::Compare { op: CompareOp::Eq, .. }));
-                assert!(matches!(rhs.as_ref(), CondExpr::Compare { op: CompareOp::Ne, .. }));
+                assert!(matches!(lhs.as_ref(), Expression::Compare { op: CompareOp::Equal, .. }));
+                assert!(matches!(rhs.as_ref(), Expression::Compare { op: CompareOp::NotEqual, .. }));
             }
             other => panic!("expected Or, got {other:?}"),
         }
@@ -335,7 +335,7 @@ mod tests {
         let expr =
             parse_condition("'$(Config)'=='Debug' And '$(Platform)'=='Win32'")
                 .unwrap();
-        assert!(matches!(expr, CondExpr::And(_, _)));
+        assert!(matches!(expr, Expression::And(_, _)));
     }
 
     #[test]
@@ -344,7 +344,7 @@ mod tests {
         let expr = parse_condition(input).unwrap();
         match &expr {
             Expression::Or(lhs, _rhs) => {
-                assert!(matches!(lhs.as_ref(), CondExpr::And(_, _)));
+                assert!(matches!(lhs.as_ref(), Expression::And(_, _)));
             }
             other => panic!("expected Or(And(..), ..), got {other:?}"),
         }
@@ -357,10 +357,10 @@ mod tests {
                 .unwrap();
         match &expr {
             Expression::Exists(parts) => {
-                assert_eq!(parts[0], StringPart::Variable("BDS".into()));
+                assert_eq!(parts[0], ExprValue::Variable("BDS".into()));
                 assert_eq!(
                     parts[1],
-                    StringPart::Literal("\\Bin\\CodeGear.Delphi.Targets".into())
+                    ExprValue::Literal("\\Bin\\CodeGear.Delphi.Targets".into())
                 );
             }
             other => panic!("expected Exists, got {other:?}"),

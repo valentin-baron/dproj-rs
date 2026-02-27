@@ -5,6 +5,31 @@ use std::collections::HashMap;
 use crate::condition;
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Expand `$(Var)` references in a raw string value using the given variable
+/// map.  Unknown variables expand to the empty string.
+fn expand_msbuild_vars(s: &str, vars: &HashMap<String, String>) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '$' && chars.peek() == Some(&'(') {
+            chars.next(); // consume '('
+            let var_name: String = chars.by_ref().take_while(|&ch| ch != ')').collect();
+            if let Some(val) = vars.get(&var_name) {
+                result.push_str(val);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  Error
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -53,6 +78,10 @@ impl From<std::io::Error> for DprojError {
 #[derive(Debug, Clone)]
 pub struct Dproj {
     source: String,
+    /// Parent directory of the `.dproj` file, used for resolving relative
+    /// paths (e.g. `MainSource`, `DCC_ExeOutput`).  `None` when created via
+    /// [`Dproj::parse`] without a file path.
+    directory: Option<std::path::PathBuf>,
     pub project: DprojProject,
 }
 
@@ -64,13 +93,20 @@ impl Dproj {
             let doc = roxmltree::Document::parse(&source)?;
             DprojProject::parse(doc.root_element())?
         };
-        Ok(Self { source, project })
+        Ok(Self { source, directory: None, project })
     }
 
     /// Load a `.dproj` file from disk.
     pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self, DprojError> {
-        let source = std::fs::read_to_string(path)?;
-        Self::parse(source)
+        let path = path.as_ref();
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| DprojError::new(format!("{}: {e}", path.display())))?;
+        let mut dproj = Self::parse(source)?;
+        dproj.directory = path
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        Ok(dproj)
     }
 
     /// The current raw XML source (reflects any mutations).
@@ -198,6 +234,123 @@ impl Dproj {
     /// The project's active platform name (e.g. `"Win32"`).
     pub fn active_platform(&self) -> Result<String, DprojError> {
         self.active_config_platform().map(|(_, p)| p)
+    }
+
+    // ─── Path accessors ──────────────────────────────────────────────────
+
+    /// The parent directory of the `.dproj` file (set by [`from_file`](Self::from_file)).
+    ///
+    /// Returns `None` when the `Dproj` was created via [`parse`](Self::parse)
+    /// without a file path.
+    pub fn directory(&self) -> Option<&std::path::Path> {
+        self.directory.as_deref()
+    }
+
+    /// Resolve the project's main source file (`.dpr` or `.dpk`).
+    ///
+    /// Reads `<MainSource>` from the first unconditional `<PropertyGroup>` and
+    /// resolves it relative to the `.dproj` file's directory.
+    pub fn get_main_source(&self) -> Result<std::path::PathBuf, DprojError> {
+        let dir = self.directory.as_deref().ok_or_else(|| {
+            DprojError::new(
+                "Cannot resolve main source: no directory (use Dproj::from_file)",
+            )
+        })?;
+
+        for pg in &self.project.property_groups {
+            if pg.condition.is_some() {
+                continue;
+            }
+            if let Some(main) = &pg.project_properties.main_source {
+                return Ok(dir.join(main));
+            }
+        }
+
+        Err(DprojError::new(
+            "No <MainSource> element found in any unconditional PropertyGroup",
+        ))
+    }
+
+    /// Resolve the project's output executable / library path.
+    ///
+    /// Consults the **active** (merged) property group so the result
+    /// respects the current `Config` / `Platform` selection.
+    ///
+    /// Resolution order:
+    /// 1. `<DCC_ExeOutput>` directory + project stem + `.exe`
+    /// 2. `<DCC_DependencyCheckOutputName>` (absolute or relative path)
+    ///
+    /// `$(Variable)` references (e.g. `$(Platform)`, `$(Config)`) inside the
+    /// path values are expanded using the active build variables.
+    ///
+    /// All paths are resolved relative to the `.dproj` file's directory.
+    pub fn get_exe_path(&self) -> Result<std::path::PathBuf, DprojError> {
+        let (config, platform) = self.active_config_platform()?;
+        self.get_exe_path_for(&config, &platform)
+    }
+
+    /// Resolve the output executable / library path for an explicitly chosen
+    /// configuration and platform.
+    ///
+    /// Same resolution as [`get_exe_path`](Self::get_exe_path) but uses the
+    /// merged property group for the given config/platform pair.
+    pub fn get_exe_path_for(
+        &self,
+        config: &str,
+        platform: &str,
+    ) -> Result<std::path::PathBuf, DprojError> {
+        let dir = self.directory.as_deref().ok_or_else(|| {
+            DprojError::new(
+                "Cannot resolve exe path: no directory (use Dproj::from_file)",
+            )
+        })?;
+
+        let vars = self.resolve_build_variables(config, platform)?;
+        let pg = self.active_property_group_for(config, platform)?;
+
+        if let Some(exe_output) = &pg.dcc_options.exe_output {
+            if let Some(stem) = self.project_stem() {
+                let expanded = expand_msbuild_vars(exe_output, &vars);
+                let exe = dir.join(expanded).join(&stem).with_extension("exe");
+                return Ok(exe);
+            }
+        }
+
+        if let Some(dep_name) = &pg.dcc_options.dependency_check_output_name {
+            let expanded = expand_msbuild_vars(dep_name, &vars);
+            return Ok(dir.join(expanded));
+        }
+
+        Err(DprojError::new(format!(
+            "No <DCC_ExeOutput> or <DCC_DependencyCheckOutputName> found for {config}/{platform}",
+        )))
+    }
+
+    /// Derive the project stem (filename without extension) from
+    /// `<ProjectName>` or `<MainSource>`.
+    fn project_stem(&self) -> Option<String> {
+        // Try ProjectName first.
+        for pg in &self.project.property_groups {
+            if pg.condition.is_some() {
+                continue;
+            }
+            if let Some(name) = &pg.project_properties.project_name {
+                return Some(name.clone());
+            }
+        }
+        // Fall back to MainSource stem.
+        for pg in &self.project.property_groups {
+            if pg.condition.is_some() {
+                continue;
+            }
+            if let Some(main) = &pg.project_properties.main_source {
+                return std::path::Path::new(main)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string());
+            }
+        }
+        None
     }
 
     // ─── Setters for default config / platform ───────────────────────────
@@ -1739,6 +1892,81 @@ mod tests {
         assert_eq!(base.project_properties.project_version.as_deref(), Some("2.0"));
         // framework_type was not overridden so it stays.
         assert_eq!(base.project_properties.framework_type.as_deref(), Some("VCL"));
+    }
+
+    // ── Path accessors ───────────────────────────────────────────────────
+
+    #[test]
+    fn directory_is_set_by_from_file() {
+        let dproj = Dproj::from_file("example.dproj").unwrap();
+        assert!(dproj.directory().is_some());
+    }
+
+    #[test]
+    fn directory_is_none_for_parse() {
+        let source = std::fs::read_to_string("example.dproj").unwrap();
+        let dproj = Dproj::parse(source).unwrap();
+        assert!(dproj.directory().is_none());
+    }
+
+    #[test]
+    fn get_main_source_resolves() {
+        let dproj = Dproj::from_file("example.dproj").unwrap();
+        let main = dproj.get_main_source().unwrap();
+        // example.dproj has <MainSource>Project1.dpr</MainSource>
+        assert_eq!(main.file_name().unwrap().to_str().unwrap(), "Project1.dpr");
+        assert!(main.is_absolute(), "should be absolute: {main:?}");
+    }
+
+    #[test]
+    fn get_main_source_fails_without_directory() {
+        let source = std::fs::read_to_string("example.dproj").unwrap();
+        let dproj = Dproj::parse(source).unwrap();
+        assert!(dproj.get_main_source().is_err());
+    }
+
+    #[test]
+    fn get_exe_path_resolves_with_variables() {
+        let dproj = Dproj::from_file("example.dproj").unwrap();
+        // example.dproj: DCC_ExeOutput = .\$(Platform)\$(Config)\DDD
+        // default config = Debug, platform = Win32, stem = Project1
+        let exe = dproj.get_exe_path().unwrap();
+        let path_str = exe.to_string_lossy();
+        // Should contain the expanded variables, not raw $(…) references
+        assert!(
+            !path_str.contains("$("),
+            "expected expanded path, got: {path_str}"
+        );
+        assert!(
+            path_str.contains("Win32") && path_str.contains("Debug"),
+            "expected Win32/Debug in path: {path_str}"
+        );
+        assert!(
+            path_str.ends_with("Project1.exe"),
+            "expected Project1.exe, got: {path_str}"
+        );
+    }
+
+    #[test]
+    fn get_exe_path_for_release() {
+        let dproj = Dproj::from_file("example.dproj").unwrap();
+        let exe = dproj.get_exe_path_for("Release", "Win64").unwrap();
+        let path_str = exe.to_string_lossy();
+        assert!(
+            path_str.contains("Win64") && path_str.contains("Release"),
+            "expected Win64/Release in path: {path_str}"
+        );
+    }
+
+    #[test]
+    fn expand_msbuild_vars_works() {
+        let mut vars = HashMap::new();
+        vars.insert("Config".into(), "Debug".into());
+        vars.insert("Platform".into(), "Win32".into());
+        assert_eq!(
+            super::expand_msbuild_vars(".\\$(Platform)\\$(Config)\\out", &vars),
+            ".\\Win32\\Debug\\out"
+        );
     }
 
 }
