@@ -82,6 +82,10 @@ pub struct Dproj {
     /// paths (e.g. `MainSource`, `DCC_ExeOutput`).  `None` when created via
     /// [`Dproj::parse`] without a file path.
     directory: Option<std::path::PathBuf>,
+    /// External environment variables (e.g. from `rsvars.bat` or the system
+    /// environment) that are seeded into the `$(Var)` expansion map before
+    /// property group evaluation.
+    env: HashMap<String, String>,
     pub project: DprojProject,
 }
 
@@ -93,7 +97,7 @@ impl Dproj {
             let doc = roxmltree::Document::parse(&source)?;
             DprojProject::parse(doc.root_element())?
         };
-        Ok(Self { source, directory: None, project })
+        Ok(Self { source, directory: None, env: HashMap::new(), project })
     }
 
     /// Load a `.dproj` file from disk.
@@ -305,20 +309,18 @@ impl Dproj {
             )
         })?;
 
-        let vars = self.resolve_build_variables(config, platform)?;
+        // active_property_group_for already expands $(Var) references.
         let pg = self.active_property_group_for(config, platform)?;
 
         if let Some(exe_output) = &pg.dcc_options.exe_output {
             if let Some(stem) = self.project_stem() {
-                let expanded = expand_msbuild_vars(exe_output, &vars);
-                let exe = dir.join(expanded).join(&stem).with_extension("exe");
+                let exe = dir.join(exe_output).join(&stem).with_extension("exe");
                 return Ok(exe);
             }
         }
 
         if let Some(dep_name) = &pg.dcc_options.dependency_check_output_name {
-            let expanded = expand_msbuild_vars(dep_name, &vars);
-            return Ok(dir.join(expanded));
+            return Ok(dir.join(dep_name));
         }
 
         Err(DprojError::new(format!(
@@ -463,6 +465,105 @@ impl Dproj {
         );
 
         Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DprojBuilder – ergonomic construction with environment variables
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Builder for constructing a [`Dproj`] with custom environment variables.
+///
+/// Environment variables are seeded into the `$(Var)` expansion map before
+/// property group evaluation, so references like `$(BDS)`, `$(BDSCOMMONDIR)`,
+/// etc. are resolved correctly.
+///
+/// # Example
+/// ```no_run
+/// use dproj_rs::{DprojBuilder, rsvars};
+///
+/// let rsvars = rsvars::parse_rsvars_file(r"C:\Delphi\bin\rsvars.bat").unwrap();
+/// let dproj = DprojBuilder::new()
+///     .env(rsvars)
+///     .system_env()
+///     .from_file("MyProject.dproj")
+///     .unwrap();
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct DprojBuilder {
+    env: HashMap<String, String>,
+}
+
+impl DprojBuilder {
+    /// Create a new builder with an empty environment.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Merge an entire variable map into the environment.
+    ///
+    /// Typically used with the result of [`crate::rsvars::parse_rsvars`] or
+    /// [`crate::rsvars::parse_rsvars_file`].
+    ///
+    /// Later calls override earlier values for the same key.
+    pub fn env(mut self, vars: HashMap<String, String>) -> Self {
+        for (k, v) in vars {
+            self.env.insert(k, v);
+        }
+        self
+    }
+
+    /// Set a single environment variable.
+    pub fn env_var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
+    /// Parse an `rsvars.bat` file from its contents and merge the resulting
+    /// variables into the environment.
+    pub fn rsvars(self, content: &str) -> Self {
+        let vars = crate::rsvars::parse_rsvars(content);
+        self.env(vars)
+    }
+
+    /// Parse an `rsvars.bat` file from disk and merge the resulting variables
+    /// into the environment.
+    pub fn rsvars_file(
+        self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, DprojError> {
+        let vars = crate::rsvars::parse_rsvars_file(path)
+            .map_err(|e| DprojError::new(format!("rsvars: {e}")))?;
+        Ok(self.env(vars))
+    }
+
+    /// Pull all current process environment variables into the map.
+    ///
+    /// Useful as a fallback layer: call this *after* [`rsvars`](Self::rsvars)
+    /// so that rsvars values take precedence over any stale system env vars.
+    /// Or call it *before* to provide a base that rsvars then overrides.
+    pub fn system_env(mut self) -> Self {
+        for (k, v) in std::env::vars() {
+            self.env.insert(k, v);
+        }
+        self
+    }
+
+    /// Parse a `.dproj` file from its XML source string.
+    pub fn parse(self, source: impl Into<String>) -> Result<Dproj, DprojError> {
+        let mut dproj = Dproj::parse(source)?;
+        dproj.env = self.env;
+        Ok(dproj)
+    }
+
+    /// Load a `.dproj` file from disk.
+    pub fn from_file(
+        self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Dproj, DprojError> {
+        let mut dproj = Dproj::from_file(path)?;
+        dproj.env = self.env;
+        Ok(dproj)
     }
 }
 
@@ -898,6 +999,31 @@ macro_rules! merge_options {
     };
 }
 
+/// Expand `$(Var)` references in every `Some` string field using the given
+/// variable map.
+macro_rules! expand_options {
+    ($self:expr, $vars:expr, $($field:ident),* $(,)?) => {
+        $(
+            if let Some(ref mut v) = $self.$field {
+                if v.contains("$(") {
+                    *v = expand_msbuild_vars(v, $vars);
+                }
+            }
+        )*
+    };
+}
+
+/// Collect all `Some` string fields into a `HashMap<tag_name, value>`.
+macro_rules! collect_tag_values {
+    ($self:expr, $map:expr, $($tag:literal => $field:ident),* $(,)?) => {
+        $(
+            if let Some(v) = &$self.$field {
+                $map.insert($tag.to_string(), v.clone());
+            }
+        )*
+    };
+}
+
 impl PropertyGroup {
     /// Merge `other` into `self`: any field that is `Some` in `other`
     /// overwrites the corresponding field in `self`.
@@ -913,6 +1039,40 @@ impl PropertyGroup {
             self.other.insert(k.clone(), v.clone());
         }
     }
+
+    /// Expand `$(Var)` references in every `Some` field using the given
+    /// variable map.  Used during MSBuild-style incremental property
+    /// evaluation so that self-referencing list properties (e.g.
+    /// `"src;$(DCC_UnitSearchPath)"`) are resolved correctly.
+    fn expand_vars(&mut self, vars: &HashMap<String, String>) {
+        self.project_properties.expand_vars(vars);
+        self.dcc_options.expand_vars(vars);
+        self.brcc_options.expand_vars(vars);
+        self.build_events.expand_vars(vars);
+        self.ver_info.expand_vars(vars);
+        self.platform_packaging.expand_vars(vars);
+        self.debugger_options.expand_vars(vars);
+        for v in self.other.values_mut() {
+            if v.contains("$(") {
+                *v = expand_msbuild_vars(v, vars);
+            }
+        }
+    }
+
+    /// Push all currently-set property values into the variable map so
+    /// that later property groups can reference them with `$(TagName)`.
+    fn collect_into_vars(&self, vars: &mut HashMap<String, String>) {
+        self.project_properties.collect_into_vars(vars);
+        self.dcc_options.collect_into_vars(vars);
+        self.brcc_options.collect_into_vars(vars);
+        self.build_events.collect_into_vars(vars);
+        self.ver_info.collect_into_vars(vars);
+        self.platform_packaging.collect_into_vars(vars);
+        self.debugger_options.collect_into_vars(vars);
+        for (k, v) in &self.other {
+            vars.insert(k.clone(), v.clone());
+        }
+    }
 }
 
 impl ProjectProperties {
@@ -924,6 +1084,42 @@ impl ProjectProperties {
             cfg_parent, sanitized_project_name, custom_styles,
             gen_package, gen_dll, use_packages,
             icon_main_icon, icns_main_icns,
+        );
+    }
+
+    fn expand_vars(&mut self, vars: &HashMap<String, String>) {
+        expand_options!(self, vars,
+            project_guid, project_version, version, framework_type,
+            config, configuration, platform, project_name,
+            targeted_platforms, app_type, main_source, base,
+            cfg_parent, sanitized_project_name, custom_styles,
+            gen_package, gen_dll, use_packages,
+            icon_main_icon, icns_main_icns,
+        );
+    }
+
+    fn collect_into_vars(&self, vars: &mut HashMap<String, String>) {
+        collect_tag_values!(self, vars,
+            "ProjectGuid" => project_guid,
+            "ProjectVersion" => project_version,
+            "Version" => version,
+            "FrameworkType" => framework_type,
+            "Config" => config,
+            "Configuration" => configuration,
+            "Platform" => platform,
+            "ProjectName" => project_name,
+            "TargetedPlatforms" => targeted_platforms,
+            "AppType" => app_type,
+            "MainSource" => main_source,
+            "Base" => base,
+            "CfgParent" => cfg_parent,
+            "SanitizedProjectName" => sanitized_project_name,
+            "Custom_Styles" => custom_styles,
+            "GenPackage" => gen_package,
+            "GenDll" => gen_dll,
+            "UsePackages" => use_packages,
+            "Icon_MainIcon" => icon_main_icon,
+            "Icns_MainIcns" => icns_main_icns,
         );
     }
 }
@@ -968,6 +1164,150 @@ impl DccOptions {
             self.warning_directives.insert(k.clone(), v.clone());
         }
     }
+
+    fn expand_vars(&mut self, vars: &HashMap<String, String>) {
+        expand_options!(self, vars,
+            dcc_compiler, dependency_check_output_name,
+            dcu_output, exe_output, dcp_output, bpl_output,
+            obj_output, hpp_output, bpi_output, cbuilder_output,
+            unit_search_path, resource_path, include_path, obj_path,
+            framework_path, sys_lib_root,
+            define, namespace, unit_alias, use_package,
+            optimize, alignment, minimum_enum_size, code_page,
+            inlining, generate_stack_frames, generate_pic_code,
+            generate_android_app_bundle_file, generate_osx_universal_binary_file,
+            e, n, s, f, k,
+            extended_syntax, long_strings, open_string_params,
+            strict_var_strings, typed_at_parameter,
+            full_boolean_evaluations, writeable_constants,
+            run_time_type_info, pentium_safe_divide,
+            io_checking, integer_overflow_check, range_checking,
+            assertions_at_runtime, imported_data_references,
+            debug_information, local_debug_symbols, symbol_reference_info,
+            debug_dcus, debug_info_in_exe, debug_info_in_tds,
+            debug_vn, remote_debug,
+            hints, warnings, show_general_messages,
+            console_target, description, additional_switches,
+            linker_options, image_base, map_file, map_file_arm,
+            stack_size, max_stack_size, min_stack_size,
+            base_address, pe_flags, pe_opt_flags,
+            pe_os_version, pe_sub_sys_version, pe_user_version,
+            nx_compat, dynamic_base, high_entropy_va, ts_aware,
+            large_address_aware, allow_undefined,
+            output_xml_documentation, output_dependencies, output_drc_file,
+            old_dos_file_names, xml_output, remove_tmp_lnk_file,
+            include_dcus_in_uses_completion, use_msbuild_externally,
+            legacy_ifend, hpp_output_arm,
+            ios_minimum_version, macos_arm_minimum_version, macos_minimum_version,
+        );
+        for v in self.warning_directives.values_mut() {
+            if v.contains("$(") {
+                *v = expand_msbuild_vars(v, vars);
+            }
+        }
+    }
+
+    fn collect_into_vars(&self, vars: &mut HashMap<String, String>) {
+        collect_tag_values!(self, vars,
+            "DCC_DCCCompiler" => dcc_compiler,
+            "DCC_DependencyCheckOutputName" => dependency_check_output_name,
+            "DCC_DcuOutput" => dcu_output,
+            "DCC_ExeOutput" => exe_output,
+            "DCC_DcpOutput" => dcp_output,
+            "DCC_BplOutput" => bpl_output,
+            "DCC_ObjOutput" => obj_output,
+            "DCC_HppOutput" => hpp_output,
+            "DCC_BpiOutput" => bpi_output,
+            "DCC_CBuilderOutput" => cbuilder_output,
+            "DCC_UnitSearchPath" => unit_search_path,
+            "DCC_ResourcePath" => resource_path,
+            "DCC_IncludePath" => include_path,
+            "DCC_ObjPath" => obj_path,
+            "DCC_FrameworkPath" => framework_path,
+            "DCC_SysLibRoot" => sys_lib_root,
+            "DCC_Define" => define,
+            "DCC_Namespace" => namespace,
+            "DCC_UnitAlias" => unit_alias,
+            "DCC_UsePackage" => use_package,
+            "DCC_Optimize" => optimize,
+            "DCC_Alignment" => alignment,
+            "DCC_MinimumEnumSize" => minimum_enum_size,
+            "DCC_CodePage" => code_page,
+            "DCC_Inlining" => inlining,
+            "DCC_GenerateStackFrames" => generate_stack_frames,
+            "DCC_GeneratePICCode" => generate_pic_code,
+            "DCC_GenerateAndroidAppBundleFile" => generate_android_app_bundle_file,
+            "DCC_GenerateOSXUniversalBinaryFile" => generate_osx_universal_binary_file,
+            "DCC_E" => e,
+            "DCC_N" => n,
+            "DCC_S" => s,
+            "DCC_F" => f,
+            "DCC_K" => k,
+            "DCC_ExtendedSyntax" => extended_syntax,
+            "DCC_LongStrings" => long_strings,
+            "DCC_OpenStringParams" => open_string_params,
+            "DCC_StrictVarStrings" => strict_var_strings,
+            "DCC_TypedAtParameter" => typed_at_parameter,
+            "DCC_FullBooleanEvaluations" => full_boolean_evaluations,
+            "DCC_WriteableConstants" => writeable_constants,
+            "DCC_RunTimeTypeInfo" => run_time_type_info,
+            "DCC_PentiumSafeDivide" => pentium_safe_divide,
+            "DCC_IOChecking" => io_checking,
+            "DCC_IntegerOverflowCheck" => integer_overflow_check,
+            "DCC_RangeChecking" => range_checking,
+            "DCC_AssertionsAtRuntime" => assertions_at_runtime,
+            "DCC_ImportedDataReferences" => imported_data_references,
+            "DCC_DebugInformation" => debug_information,
+            "DCC_LocalDebugSymbols" => local_debug_symbols,
+            "DCC_SymbolReferenceInfo" => symbol_reference_info,
+            "DCC_DebugDCUs" => debug_dcus,
+            "DCC_DebugInfoInExe" => debug_info_in_exe,
+            "DCC_DebugInfoInTds" => debug_info_in_tds,
+            "DCC_DebugVN" => debug_vn,
+            "DCC_RemoteDebug" => remote_debug,
+            "DCC_Hints" => hints,
+            "DCC_Warnings" => warnings,
+            "DCC_ShowGeneralMessages" => show_general_messages,
+            "DCC_ConsoleTarget" => console_target,
+            "DCC_Description" => description,
+            "DCC_AdditionalSwitches" => additional_switches,
+            "DCC_LinkerOptions" => linker_options,
+            "DCC_ImageBase" => image_base,
+            "DCC_MapFile" => map_file,
+            "DCC_MapFileARM" => map_file_arm,
+            "DCC_StackSize" => stack_size,
+            "DCC_MaxStackSize" => max_stack_size,
+            "DCC_MinStackSize" => min_stack_size,
+            "DCC_BaseAddress" => base_address,
+            "DCC_PEFlags" => pe_flags,
+            "DCC_PEOptFlags" => pe_opt_flags,
+            "DCC_PEOSVersion" => pe_os_version,
+            "DCC_PESubSysVersion" => pe_sub_sys_version,
+            "DCC_PEUserVersion" => pe_user_version,
+            "DCC_NXCompat" => nx_compat,
+            "DCC_DynamicBase" => dynamic_base,
+            "DCC_HighEntropyVa" => high_entropy_va,
+            "DCC_TSAware" => ts_aware,
+            "DCC_LargeAddressAware" => large_address_aware,
+            "DCC_AllowUndefined" => allow_undefined,
+            "DCC_OutputXMLDocumentation" => output_xml_documentation,
+            "DCC_OutputDependencies" => output_dependencies,
+            "DCC_OutputDRCFile" => output_drc_file,
+            "DCC_OldDosFileNames" => old_dos_file_names,
+            "DCC_XmlOutput" => xml_output,
+            "DCC_RemoveTmpLnkFile" => remove_tmp_lnk_file,
+            "DCC_IncludeDCUsInUsesCompletion" => include_dcus_in_uses_completion,
+            "DCC_UseMSBuildExternally" => use_msbuild_externally,
+            "DCC_LegacyIFEND" => legacy_ifend,
+            "DCC_HppOutputARM" => hpp_output_arm,
+            "DCC_iOSMinimumVersion" => ios_minimum_version,
+            "DCC_macOSArmMinimumVersion" => macos_arm_minimum_version,
+            "DCC_macOSMinimumVersion" => macos_minimum_version,
+        );
+        for (k, v) in &self.warning_directives {
+            vars.insert(k.clone(), v.clone());
+        }
+    }
 }
 
 impl BrccOptions {
@@ -976,6 +1316,30 @@ impl BrccOptions {
             user_supplied_options, code_page, language,
             delete_include_path, enable_multi_byte, compiler_to_use,
             response_filename, verbose, defines, include_path, output_dir,
+        );
+    }
+
+    fn expand_vars(&mut self, vars: &HashMap<String, String>) {
+        expand_options!(self, vars,
+            user_supplied_options, code_page, language,
+            delete_include_path, enable_multi_byte, compiler_to_use,
+            response_filename, verbose, defines, include_path, output_dir,
+        );
+    }
+
+    fn collect_into_vars(&self, vars: &mut HashMap<String, String>) {
+        collect_tag_values!(self, vars,
+            "BRCC_UserSuppliedOptions" => user_supplied_options,
+            "BRCC_CodePage" => code_page,
+            "BRCC_Language" => language,
+            "BRCC_DeleteIncludePath" => delete_include_path,
+            "BRCC_EnableMultiByte" => enable_multi_byte,
+            "BRCC_CompilerToUse" => compiler_to_use,
+            "BRCC_ResponseFilename" => response_filename,
+            "BRCC_Verbose" => verbose,
+            "BRCC_Defines" => defines,
+            "BRCC_IncludePath" => include_path,
+            "BRCC_OutputDir" => output_dir,
         );
     }
 }
@@ -991,6 +1355,32 @@ impl BuildEvents {
             post_build_event_ignore_exit_code, post_build_event_execute_when,
         );
     }
+
+    fn expand_vars(&mut self, vars: &HashMap<String, String>) {
+        expand_options!(self, vars,
+            pre_build_event, pre_build_event_cancel_on_error,
+            pre_build_event_ignore_exit_code,
+            pre_link_event, pre_link_event_cancel_on_error,
+            pre_link_event_ignore_exit_code,
+            post_build_event, post_build_event_cancel_on_error,
+            post_build_event_ignore_exit_code, post_build_event_execute_when,
+        );
+    }
+
+    fn collect_into_vars(&self, vars: &mut HashMap<String, String>) {
+        collect_tag_values!(self, vars,
+            "PreBuildEvent" => pre_build_event,
+            "PreBuildEventCancelOnError" => pre_build_event_cancel_on_error,
+            "PreBuildEventIgnoreExitCode" => pre_build_event_ignore_exit_code,
+            "PreLinkEvent" => pre_link_event,
+            "PreLinkEventCancelOnError" => pre_link_event_cancel_on_error,
+            "PreLinkEventIgnoreExitCode" => pre_link_event_ignore_exit_code,
+            "PostBuildEvent" => post_build_event,
+            "PostBuildEventCancelOnError" => post_build_event_cancel_on_error,
+            "PostBuildEventIgnoreExitCode" => post_build_event_ignore_exit_code,
+            "PostBuildEventExecuteWhen" => post_build_event_execute_when,
+        );
+    }
 }
 
 impl VerInfo {
@@ -999,6 +1389,32 @@ impl VerInfo {
             include_ver_info, major_ver, minor_ver, release, build,
             debug, pre_release, special, private, dll,
             auto_gen_version, locale, keys,
+        );
+    }
+
+    fn expand_vars(&mut self, vars: &HashMap<String, String>) {
+        expand_options!(self, vars,
+            include_ver_info, major_ver, minor_ver, release, build,
+            debug, pre_release, special, private, dll,
+            auto_gen_version, locale, keys,
+        );
+    }
+
+    fn collect_into_vars(&self, vars: &mut HashMap<String, String>) {
+        collect_tag_values!(self, vars,
+            "VerInfo_IncludeVerInfo" => include_ver_info,
+            "VerInfo_MajorVer" => major_ver,
+            "VerInfo_MinorVer" => minor_ver,
+            "VerInfo_Release" => release,
+            "VerInfo_Build" => build,
+            "VerInfo_Debug" => debug,
+            "VerInfo_PreRelease" => pre_release,
+            "VerInfo_Special" => special,
+            "VerInfo_Private" => private,
+            "VerInfo_DLL" => dll,
+            "VerInfo_AutoGenVersion" => auto_gen_version,
+            "VerInfo_Locale" => locale,
+            "VerInfo_Keys" => keys,
         );
     }
 }
@@ -1014,12 +1430,57 @@ impl PlatformPackaging {
             pf_uwp_distribution_type, uwp_delphi_logo44, uwp_delphi_logo150,
         );
     }
+
+    fn expand_vars(&mut self, vars: &HashMap<String, String>) {
+        expand_options!(self, vars,
+            app_dpi_awareness_mode, app_enable_runtime_themes,
+            app_execution_level, app_execution_level_ui_access,
+            manifest_file, output_ext, bt_build_type,
+            pf_uwp_publisher, pf_uwp_package_name,
+            pf_uwp_package_display_name, pf_uwp_publisher_display_name,
+            pf_uwp_distribution_type, uwp_delphi_logo44, uwp_delphi_logo150,
+        );
+    }
+
+    fn collect_into_vars(&self, vars: &mut HashMap<String, String>) {
+        collect_tag_values!(self, vars,
+            "AppDPIAwarenessMode" => app_dpi_awareness_mode,
+            "AppEnableRuntimeThemes" => app_enable_runtime_themes,
+            "AppExecutionLevel" => app_execution_level,
+            "AppExecutionLevelUIAccess" => app_execution_level_ui_access,
+            "Manifest_File" => manifest_file,
+            "OutputExt" => output_ext,
+            "BT_BuildType" => bt_build_type,
+            "PF_UWPPublisher" => pf_uwp_publisher,
+            "PF_UWPPackageName" => pf_uwp_package_name,
+            "PF_UWPPackageDisplayName" => pf_uwp_package_display_name,
+            "PF_UWPPublisherDisplayName" => pf_uwp_publisher_display_name,
+            "PF_UWPDistributionType" => pf_uwp_distribution_type,
+            "UWP_DelphiLogo44" => uwp_delphi_logo44,
+            "UWP_DelphiLogo150" => uwp_delphi_logo150,
+        );
+    }
 }
 
 impl DebuggerOptions {
     fn merge_from(&mut self, o: &Self) {
         merge_options!(self, o,
             include_system_vars, env_vars, symbol_source_path, run_params,
+        );
+    }
+
+    fn expand_vars(&mut self, vars: &HashMap<String, String>) {
+        expand_options!(self, vars,
+            include_system_vars, env_vars, symbol_source_path, run_params,
+        );
+    }
+
+    fn collect_into_vars(&self, vars: &mut HashMap<String, String>) {
+        collect_tag_values!(self, vars,
+            "Debugger_IncludeSystemVars" => include_system_vars,
+            "Debugger_EnvVars" => env_vars,
+            "Debugger_SymbolSourcePath" => symbol_source_path,
+            "Debugger_RunParams" => run_params,
         );
     }
 }
@@ -1042,7 +1503,15 @@ impl Dproj {
         config: &str,
         platform: &str,
     ) -> Result<HashMap<String, String>, DprojError> {
-        let mut vars = HashMap::new();
+        // Start with external environment variables (rsvars, system env, etc.)
+        let mut vars = self.env.clone();
+
+        // Built-in MSBuild-style variables derived from the project stem.
+        if let Some(stem) = self.project_stem() {
+            vars.insert("MSBuildProjectName".to_string(), stem);
+        }
+
+        // Config / Platform override anything from the environment.
         vars.insert("Config".to_string(), config.to_string());
         vars.insert("Configuration".to_string(), config.to_string());
         vars.insert("Platform".to_string(), platform.to_string());
@@ -1111,7 +1580,8 @@ impl Dproj {
         config: &str,
         platform: &str,
     ) -> Result<PropertyGroup, DprojError> {
-        let vars = self.resolve_build_variables(config, platform)?;
+        let build_vars = self.resolve_build_variables(config, platform)?;
+        let mut vars = build_vars.clone();
         let mut result = PropertyGroup::default();
 
         for pg in &self.project.property_groups {
@@ -1124,7 +1594,21 @@ impl Dproj {
             };
 
             if matches {
-                result.merge_from(pg);
+                // Clone and expand $(Var) references using the accumulated
+                // property map so that self-referencing list properties
+                // (e.g. "src;$(DCC_UnitSearchPath)") resolve correctly.
+                let mut expanded = pg.clone();
+                expanded.expand_vars(&vars);
+                result.merge_from(&expanded);
+                // Feed the newly-merged values back into the variable map
+                // so subsequent PGs can reference them.
+                result.collect_into_vars(&mut vars);
+                // Re-assert build variables: the requested config/platform
+                // must always take priority over project-level defaults
+                // (e.g. an unconditional PG may set <Config>Debug</Config>).
+                for (k, v) in &build_vars {
+                    vars.insert(k.clone(), v.clone());
+                }
             }
         }
 
@@ -1966,6 +2450,176 @@ mod tests {
         assert_eq!(
             super::expand_msbuild_vars(".\\$(Platform)\\$(Config)\\out", &vars),
             ".\\Win32\\Debug\\out"
+        );
+    }
+
+    // ── List-property accumulation ───────────────────────────────────────
+
+    #[test]
+    fn active_pg_accumulates_list_properties() {
+        let dproj = Dproj::from_file("example.dproj").unwrap();
+        // Default: Debug/Win32
+        let pg = dproj.active_property_group().unwrap();
+
+        // DCC_Define should accumulate across PGs:
+        //   Base PG:  "AAA;$(DCC_Define)"      → "AAA;"
+        //   Cfg_1:    "DEBUG;$(DCC_Define)"     → "DEBUG;AAA;"
+        let define = pg.dcc_options.define.as_deref().unwrap();
+        assert!(define.contains("DEBUG"), "expected DEBUG in defines: {define}");
+        assert!(define.contains("AAA"), "expected AAA in defines: {define}");
+        assert!(
+            !define.contains("$(DCC_Define)"),
+            "expected expanded defines, got: {define}"
+        );
+
+        // DCC_Namespace should accumulate from Base + Base_Win32:
+        //   Base:      "System;Xml;...;JJJ;$(DCC_Namespace)"
+        //   Base_Win32: "Winapi;System.Win;...;Bde;$(DCC_Namespace)"
+        let ns = pg.dcc_options.namespace.as_deref().unwrap();
+        assert!(ns.contains("Winapi"), "expected Winapi in namespace: {ns}");
+        assert!(ns.contains("JJJ"), "expected JJJ in namespace: {ns}");
+        assert!(
+            !ns.contains("$(DCC_Namespace)"),
+            "expected expanded namespace, got: {ns}"
+        );
+
+        // DCC_UnitSearchPath should accumulate:
+        //   Base: "EEE;$(DCC_UnitSearchPath)" → "EEE;"
+        let usp = pg.dcc_options.unit_search_path.as_deref().unwrap();
+        assert!(usp.contains("EEE"), "expected EEE in search path: {usp}");
+        assert!(
+            !usp.contains("$(DCC_UnitSearchPath)"),
+            "expected expanded search path, got: {usp}"
+        );
+    }
+
+    #[test]
+    fn active_pg_release_accumulates_defines() {
+        let dproj = Dproj::from_file("example.dproj").unwrap();
+        let pg = dproj.active_property_group_for("Release", "Win32").unwrap();
+
+        // Release: "RELEASE;$(DCC_Define)" should pick up AAA from Base.
+        let define = pg.dcc_options.define.as_deref().unwrap();
+        assert!(define.contains("RELEASE"), "expected RELEASE: {define}");
+        assert!(define.contains("AAA"), "expected AAA from base: {define}");
+        assert!(
+            !define.contains("DEBUG"),
+            "Release should NOT contain DEBUG: {define}"
+        );
+    }
+
+    // ── DprojBuilder & env expansion ─────────────────────────────────────
+
+    #[test]
+    fn builder_from_file_basic() {
+        let dproj = DprojBuilder::new()
+            .from_file("example.dproj")
+            .unwrap();
+        assert_eq!(dproj.active_configuration().unwrap(), "Debug");
+    }
+
+    #[test]
+    fn builder_with_env_var() {
+        let dproj = DprojBuilder::new()
+            .env_var("BDS", r"C:\TestDelphi")
+            .from_file("example.dproj")
+            .unwrap();
+        let pg = dproj.active_property_group().unwrap();
+        // Icon_MainIcon = $(BDS)\bin\delphi_PROJECTICON.ico
+        let icon = pg.project_properties.icon_main_icon.as_deref().unwrap();
+        assert!(
+            icon.contains(r"C:\TestDelphi"),
+            "expected expanded BDS in icon path: {icon}"
+        );
+        assert!(
+            !icon.contains("$(BDS)"),
+            "expected no raw $(BDS) in icon path: {icon}"
+        );
+    }
+
+    #[test]
+    fn builder_with_rsvars_content() {
+        let rsvars_content = std::fs::read_to_string("rsvars.bat").unwrap();
+        let dproj = DprojBuilder::new()
+            .rsvars(&rsvars_content)
+            .from_file("example.dproj")
+            .unwrap();
+        let pg = dproj.active_property_group().unwrap();
+        // Icon_MainIcon should have the real BDS path expanded
+        let icon = pg.project_properties.icon_main_icon.as_deref().unwrap();
+        assert!(
+            icon.contains("Embarcadero"),
+            "expected Embarcadero in expanded icon path: {icon}"
+        );
+        // Custom_Styles should have $(BDSCOMMONDIR) expanded
+        let styles = pg.project_properties.custom_styles.as_deref().unwrap();
+        assert!(
+            !styles.contains("$(BDSCOMMONDIR)"),
+            "expected expanded BDSCOMMONDIR: {styles}"
+        );
+    }
+
+    #[test]
+    fn builder_with_rsvars_file() {
+        let dproj = DprojBuilder::new()
+            .rsvars_file("rsvars.bat")
+            .unwrap()
+            .from_file("example.dproj")
+            .unwrap();
+        let pg = dproj.active_property_group().unwrap();
+        let icon = pg.project_properties.icon_main_icon.as_deref().unwrap();
+        assert!(
+            !icon.contains("$(BDS)"),
+            "expected expanded BDS: {icon}"
+        );
+    }
+
+    #[test]
+    fn builder_env_map() {
+        let mut env = HashMap::new();
+        env.insert("BDS".into(), r"D:\Studio".into());
+        env.insert("BDSCOMMONDIR".into(), r"D:\Common".into());
+        let dproj = DprojBuilder::new()
+            .env(env)
+            .from_file("example.dproj")
+            .unwrap();
+        let pg = dproj.active_property_group().unwrap();
+        let styles = pg.project_properties.custom_styles.as_deref().unwrap();
+        assert!(
+            styles.contains(r"D:\Common"),
+            "expected D:\\Common in styles: {styles}"
+        );
+    }
+
+    #[test]
+    fn builder_parse_string() {
+        let source = std::fs::read_to_string("example.dproj").unwrap();
+        let dproj = DprojBuilder::new()
+            .env_var("BDS", r"C:\MyBDS")
+            .parse(source)
+            .unwrap();
+        let pg = dproj.active_property_group().unwrap();
+        let icon = pg.project_properties.icon_main_icon.as_deref().unwrap();
+        assert!(
+            icon.contains(r"C:\MyBDS"),
+            "expected C:\\MyBDS in icon: {icon}"
+        );
+    }
+
+    #[test]
+    fn msbuild_project_name_expanded() {
+        let dproj = Dproj::from_file("example.dproj").unwrap();
+        let pg = dproj.active_property_group().unwrap();
+        // VerInfo_Keys contains $(MSBuildProjectName) which should resolve
+        // to the project stem "Project1".
+        let keys = pg.ver_info.keys.as_deref().unwrap();
+        assert!(
+            keys.contains("Project1"),
+            "expected Project1 in VerInfo_Keys: {keys}"
+        );
+        assert!(
+            !keys.contains("$(MSBuildProjectName)"),
+            "expected expanded MSBuildProjectName: {keys}"
         );
     }
 

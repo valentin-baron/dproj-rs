@@ -2,6 +2,12 @@
 name = "dproj-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Parse Embarcadero Delphi/RAD Studio .dproj project files and rsvars.bat environment variables"
+license = "MIT"
+repository = "https://github.com/valentin-baron/dproj-rs"
+documentation = "https://docs.rs/dproj-rs"
+homepage = "https://github.com/valentin-baron/dproj-rs"
+authors = ["Valentin Baron"]
 
 [dependencies]
 chumsky = "0.12.0"

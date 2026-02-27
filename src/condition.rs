@@ -47,7 +47,7 @@ pub enum Expression {
     Or(Box<Expression>, Box<Expression>),
 }
 
-/// Comparison operator used inside a [`CondExpr::Compare`].
+/// Comparison operator used inside an [`Expression::Compare`] variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareOp {
     /// `==`
@@ -166,7 +166,7 @@ fn condition_parser<'a>() -> impl Parser<'a, &'a str, Expression, extra::Err<Sim
     })
 }
 
-/// Parse a condition attribute string into a [`CondExpr`] AST.
+/// Parse a condition attribute string into an [`Expression`] AST.
 pub fn parse_condition(input: &str) -> Result<Expression, String> {
     condition_parser()
         .parse(input)
