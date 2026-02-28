@@ -485,7 +485,6 @@ impl Dproj {
 /// let rsvars = rsvars::parse_rsvars_file(r"C:\Delphi\bin\rsvars.bat").unwrap();
 /// let dproj = DprojBuilder::new()
 ///     .env(rsvars)
-///     .system_env()
 ///     .from_file("MyProject.dproj")
 ///     .unwrap();
 /// ```
@@ -535,18 +534,6 @@ impl DprojBuilder {
         let vars = crate::rsvars::parse_rsvars_file(path)
             .map_err(|e| DprojError::new(format!("rsvars: {e}")))?;
         Ok(self.env(vars))
-    }
-
-    /// Pull all current process environment variables into the map.
-    ///
-    /// Useful as a fallback layer: call this *after* [`rsvars`](Self::rsvars)
-    /// so that rsvars values take precedence over any stale system env vars.
-    /// Or call it *before* to provide a base that rsvars then overrides.
-    pub fn system_env(mut self) -> Self {
-        for (k, v) in std::env::vars() {
-            self.env.insert(k, v);
-        }
-        self
     }
 
     /// Parse a `.dproj` file from its XML source string.

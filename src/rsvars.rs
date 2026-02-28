@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 
 /// Expand `%VAR%` references in a value using the already-accumulated map.
-/// Unknown variables fall back to the real process environment.
+/// Unknown variables expand to the empty string.
 fn expand_percent_vars(s: &str, vars: &HashMap<String, String>) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -18,12 +18,10 @@ fn expand_percent_vars(s: &str, vars: &HashMap<String, String>) -> String {
     while let Some(c) = chars.next() {
         if c == '%' {
             let var_name: String = chars.by_ref().take_while(|&ch| ch != '%').collect();
-            if let Some(val) = vars.get(&var_name) {
+            if let Some(val) = vars.get(&var_name.to_ascii_uppercase()) {
                 result.push_str(val);
-            } else if let Ok(val) = std::env::var(&var_name) {
-                result.push_str(&val);
             }
-            // Truly unknown variables expand to the empty string.
+            // Unknown variables expand to the empty string.
         } else {
             result.push(c);
         }
@@ -33,6 +31,12 @@ fn expand_percent_vars(s: &str, vars: &HashMap<String, String>) -> String {
 }
 
 /// Parse the **contents** of an `rsvars.bat` file into a variable map.
+///
+/// The returned map is seeded with **all current process environment variables**
+/// first; entries from the file then override them.  This means `%VAR%`
+/// references in the file can expand against any variable already present in
+/// the environment, and the caller does not need to merge system env vars
+/// separately.
 ///
 /// Each line of the form `@SET KEY=VALUE` or `SET KEY=VALUE` (case-insensitive)
 /// is parsed.  `%VAR%` references inside values are expanded using the
@@ -51,7 +55,13 @@ fn expand_percent_vars(s: &str, vars: &HashMap<String, String>) -> String {
 /// assert_eq!(vars["BDSBIN"], r"C:\Delphi\bin");
 /// ```
 pub fn parse_rsvars(content: &str) -> HashMap<String, String> {
-    let mut vars = HashMap::new();
+    // Seed with the full process environment so that %VAR% references in the
+    // file can expand against any already-set variable.  File entries are
+    // inserted afterwards and therefore override duplicates.
+    // All keys are stored uppercased to match Windows' case-insensitive
+    // environment variable semantics (e.g. `Path` and `PATH` are the same).
+    let mut vars: HashMap<String, String> =
+        std::env::vars().map(|(k, v)| (k.to_ascii_uppercase(), v)).collect();
 
     for line in content.lines() {
         let trimmed = line.trim();
@@ -74,7 +84,7 @@ pub fn parse_rsvars(content: &str) -> HashMap<String, String> {
             continue;
         };
 
-        let key = rest[..eq_pos].trim().to_string();
+        let key = rest[..eq_pos].trim().to_ascii_uppercase();
         if key.is_empty() {
             continue;
         }
@@ -162,8 +172,11 @@ REM This is a comment
 :: another comment
 ";
         let vars = parse_rsvars(content);
-        assert_eq!(vars.len(), 1);
+        // Non-SET lines must not produce entries; only the one BDS entry
+        // should have been added on top of the pre-seeded system env vars.
         assert_eq!(vars["BDS"], "C:\\Delphi");
+        assert!(!vars.contains_key("ECHO"), "@echo off must not be parsed as a variable");
+        assert!(!vars.contains_key("REM"), "comment lines must not produce entries");
     }
 
     #[test]
@@ -175,8 +188,9 @@ REM This is a comment
     }
 
     #[test]
-    fn percent_var_falls_back_to_system_env() {
-        // %PATH% is always set in the real environment.
+    fn percent_var_resolves_from_seeded_env() {
+        // %PATH% is pre-seeded from the process environment, so the expansion
+        // works without any explicit fallback lookup.
         let content = "@SET MY_PATH=%PATH%\n";
         let vars = parse_rsvars(content);
         let real_path = std::env::var("PATH").unwrap_or_default();
